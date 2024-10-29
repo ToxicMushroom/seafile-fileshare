@@ -1,12 +1,12 @@
 use anyhow::Error;
 use reqwest::redirect::Policy;
-use reqwest::{multipart, Client, RequestBuilder};
+use reqwest::{multipart, Client, RequestBuilder, Url};
 use serde::{Deserialize, Serialize};
 use std::cmp::min;
-use std::fmt::format;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -108,7 +108,7 @@ struct SeafileShareObj {
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
-struct SeafileCreateaShareLinkParams {
+struct SeafileCreateShareLinkParams {
     /// ID of the library/repo
     repo_id: String,
     /// Folder/file to share
@@ -120,9 +120,10 @@ struct SeafileCreateaShareLinkParams {
     /// Permissions for this share link
     permissions: SeafileSharePermissions,
 }
-use clap::Parser;
+use clap::{Parser};
 use futures_util::StreamExt;
 use keyring::Entry;
+use log::info;
 use notify_rust::{Hint, Notification, NotificationHandle};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use rusqlite::{Connection, OpenFlags};
@@ -135,9 +136,12 @@ struct Args {
     /// File to upload
     #[clap(short, long)]
     file: PathBuf,
-    /// Seafile server endpoint (e.g. https://seafile.example.com)
+    /// Seafile server endpoint (e.g. https://seafile.example.com:443)
     #[clap(long)]
     host: String,
+    /// Seafile-Embedder server endpoint (e.g. https://d.example.com:443)
+    #[clap(long)]
+    embed_host: String,
     /// User, your email/username
     username: String,
     /// Library/repo token, obtained via the Library's context menu > Advanced > Api Tokens
@@ -151,6 +155,7 @@ struct Args {
 struct CommunicationContext {
     client: Client,
     host: String,
+    user: String,
 }
 
 #[tokio::main]
@@ -159,7 +164,7 @@ async fn main() {
     let args = Args::parse();
     let client = Client::new();
 
-    let account_token = match get_account_token(args.username).await {
+    let account_token = match get_account_token(&args.username, &args.host).await {
         Ok(token) => token,
         Err(e) => {
             println!("{}", e);
@@ -170,6 +175,7 @@ async fn main() {
     let com_ctx = CommunicationContext {
         client,
         host: args.host,
+        user: args.username,
     };
 
     // The seafile library (repo) you want to upload to
@@ -209,9 +215,28 @@ async fn main() {
     .pop()
     .unwrap();
 
-    let share_link =
-        seafile_get_share_link(&com_ctx, repo_id, &account_token, parent_dir, uploaded_file).await;
-    let raw_link = fetch_redirect_loc(format!("{share_link}?dl=1")).await;
+    let ext = uploaded_file.name.rsplit_once(".").map(|t| t.1.to_string());
+
+    let share_link = seafile_get_share_link(
+        &com_ctx,
+        repo_id,
+        &account_token,
+        parent_dir,
+        uploaded_file,
+        true,
+    )
+    .await;
+    let share_url = Url::parse(share_link.as_str()).expect("Share link is not a url");
+
+    let mut opt_id = None;
+    if let Some(segment) = share_url.path_segments() {
+        opt_id = segment.collect::<Vec<&str>>().get(1).map(|s| s.to_string())
+    }
+    let raw_link = if let Some(seaf_share_id) = opt_id {
+        format!("{}/{}/file.{}", args.embed_host, seaf_share_id, ext.unwrap_or("mp4".to_string()))
+    } else {
+        fetch_redirect_loc(format!("{share_link}?dl=1")).await
+    };
 
     // Show finished notification
     notification_handle
@@ -245,7 +270,11 @@ async fn main() {
                 }
             }
             "open" => {
-                // TODO: xdg-open the url
+                Command::new("xdg-open")
+                    .arg(raw_link.as_str())
+                    .output()
+                    .expect("failed to call xdg-open");
+                println!("Opened successfully");
             }
             "default" => println!("you clicked \"default\""),
             "clicked" => println!("don hector salamanca, kill them"),
@@ -270,13 +299,13 @@ async fn main() {
     }
 }
 
-async fn get_account_token(user: String) -> Result<SeafileAccToken, Error> {
+async fn get_account_token(user: &String, host: &String) -> Result<SeafileAccToken, Error> {
     let entry = Entry::new("seafile", user.as_str())?;
     let token = entry.get_password();
     let token_str = match token {
         Ok(token) => token,
         Err(_no_token) => {
-            let token = borrow_account_token_from_seafile(user)?;
+            let token = borrow_account_token_from_seafile(host)?;
             entry.set_password(token.as_str())?;
             token
         }
@@ -284,13 +313,18 @@ async fn get_account_token(user: String) -> Result<SeafileAccToken, Error> {
     Ok(SeafileAccToken { token: token_str })
 }
 
-fn borrow_account_token_from_seafile(user: String) -> Result<String, Error> {
-    // TODO: Replace with home getter
+async fn nuke_entry(user: &String) -> Result<(), Error> {
+    let entry = Entry::new("seafile", user.as_str())?;
+    entry.delete_credential()?;
+    Ok(())
+}
+
+fn borrow_account_token_from_seafile(host: &String) -> Result<String, Error> {
     let seaf_data_path = fs::read_to_string(format!("{}/.ccnet/seafile.ini", env!("HOME")))?;
     let seaf_accounts_path = format!("{seaf_data_path}/accounts.db");
     let con = Connection::open_with_flags(&seaf_accounts_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let mut stmt = con.prepare("SELECT token FROM Accounts WHERE username= :user")?;
-    let mapper = stmt.query_map(&[(":user", user.as_str())], |row| {
+    let mut stmt = con.prepare("SELECT token FROM Accounts WHERE url= :url_base")?;
+    let mapper = stmt.query_map(&[(":url_base", host.as_str())], |row| {
         row.get::<&str, String>("token")
     })?;
     let token = mapper
@@ -329,7 +363,7 @@ async fn fire<T: DeserializeOwned>(req_builder: RequestBuilder) -> Result<T, Err
                 .text()
                 .await
                 .expect("apparently they didnt send us text");
-            let result = serde_json::from_str(result_text.clone().as_str());
+            let result = serde_json::from_str((&result_text).as_str());
             match result {
                 Ok(good) => Ok(good),
                 Err(bad) => {
@@ -354,8 +388,11 @@ async fn seafile_get_share_link(
     account_token: &SeafileAccToken,
     parent_dir: &str,
     file: SeafileUploadObj,
+    is_retry: bool,
 ) -> String {
-    let share_link_params = SeafileCreateaShareLinkParams {
+    let username = &ctx.user;
+    let host = &ctx.host;
+    let share_link_params = SeafileCreateShareLinkParams {
         repo_id: repo_id.to_string(),
         permissions: SeafileSharePermissions::download_only(),
         path: format!("{}{}", parent_dir, file.name),
@@ -368,9 +405,31 @@ async fn seafile_get_share_link(
             .bearer_auth(&account_token.token)
             .json(&share_link_params),
     )
-    .await
-    .unwrap();
-    share_obj.link
+    .await;
+    if let Ok(share_obj) = share_obj {
+        share_obj.link
+    } else {
+        if !is_retry {
+            nuke_entry(&username)
+                .await
+                .expect("Failed to purge entry, maybe keyring died");
+            let new_acc_token = get_account_token(&username, &host)
+                .await
+                .expect("Failed steal token, maybe not signed into seaf-applet or dead keyring");
+            info!("No share link found. Possibly a bad session, attempting fix.");
+            Box::pin(seafile_get_share_link(
+                ctx,
+                repo_id,
+                &new_acc_token,
+                parent_dir,
+                file,
+                is_retry,
+            ))
+            .await
+        } else {
+            panic!("No share link found. Couldn't fix session");
+        }
+    }
 }
 
 async fn seafile_post_upload(
